@@ -109,40 +109,120 @@ def _obb_iou(box_a: list[float], box_b: list[float]) -> float:
     return intersection / union if union > 0 else 0.0
 
 
-def nms_obb(
-    detections: list[dict[str, Any]],
-    iou_threshold: float = 0.45,
-) -> list[dict[str, Any]]:
-    """Apply NMS to a list of oriented bounding box detections.
+def _aabb_iou(box_a: list[float], box_b: list[float]) -> float:
+    """Fast axis-aligned bounding box IoU for coarse-pass NMS.
+
+    Computes the AABB enclosing the rotated OBB, then calculates standard IoU.
 
     Args:
-        detections: List of detection dicts, each with at least:
-
-            * ``"bbox"`` – ``[cx, cy, w, h, angle_deg]``
-            * ``"confidence"`` – float score in ``[0, 1]``
-
-        iou_threshold: IoU threshold above which the lower-confidence box is
-            suppressed (default 0.45).
+        box_a: OBB as ``[cx, cy, w, h, angle_deg]``.
+        box_b: OBB as ``[cx, cy, w, h, angle_deg]``.
 
     Returns:
-        Filtered list of detections after NMS.
+        Axis-aligned IoU in ``[0, 1]``.
     """
+    import math
+
+    def _obb_to_aabb(b: list[float]) -> tuple[float, float, float, float]:
+        cx, cy, bw, bh, angle = b
+        rad = math.radians(angle)
+        cos_a, sin_a = abs(math.cos(rad)), abs(math.sin(rad))
+        # Half-extents of the axis-aligned enclosure
+        half_w = (bw * cos_a + bh * sin_a) / 2
+        half_h = (bw * sin_a + bh * cos_a) / 2
+        return cx - half_w, cy - half_h, cx + half_w, cy + half_h
+
+    x1a, y1a, x2a, y2a = _obb_to_aabb(box_a)
+    x1b, y1b, x2b, y2b = _obb_to_aabb(box_b)
+
+    inter_x1 = max(x1a, x1b)
+    inter_y1 = max(y1a, y1b)
+    inter_x2 = min(x2a, x2b)
+    inter_y2 = min(y2a, y2b)
+    inter_area = max(0, inter_x2 - inter_x1) * max(0, inter_y2 - inter_y1)
+
+    area_a = (x2a - x1a) * (y2a - y1a)
+    area_b = (x2b - x1b) * (y2b - y1b)
+    union_area = area_a + area_b - inter_area
+    return inter_area / union_area if union_area > 0 else 0.0
+
+
+def _greedy_nms(
+    detections: list[dict[str, Any]],
+    iou_fn,
+    iou_threshold: float,
+) -> list[dict[str, Any]]:
+    """Generic greedy NMS using a pluggable IoU function."""
     if not detections:
         return []
-
     sorted_dets = sorted(detections, key=lambda d: d["confidence"], reverse=True)
     kept: list[dict[str, Any]] = []
-
     while sorted_dets:
         best = sorted_dets.pop(0)
         kept.append(best)
         sorted_dets = [
-            d
-            for d in sorted_dets
-            if _obb_iou(best["bbox"], d["bbox"]) < iou_threshold
+            d for d in sorted_dets
+            if iou_fn(best["bbox"], d["bbox"]) < iou_threshold
         ]
-
     return kept
+
+
+def nms_obb(
+    detections: list[dict[str, Any]],
+    iou_threshold: float = 0.45,
+) -> list[dict[str, Any]]:
+    """Single-pass polygon NMS (legacy interface).
+
+    Args:
+        detections: Detection dicts with ``"bbox"`` and ``"confidence"``.
+        iou_threshold: IoU threshold (default 0.45).
+
+    Returns:
+        Filtered detections.
+    """
+    return _greedy_nms(detections, _obb_iou, iou_threshold)
+
+
+def nms_obb_two_stage(
+    detections: list[dict[str, Any]],
+    horizontal_iou: float = 0.8,
+    polygon_iou: float = 0.1,
+    confidence_threshold: float = 0.05,
+) -> list[dict[str, Any]]:
+    """Two-stage NMS from the OpenSARWake paper (Xu & Wang, 2024).
+
+    Stage 1: Axis-aligned bounding box NMS with a loose IoU threshold (0.8)
+    to cheaply reduce redundant overlapping detections.
+
+    Stage 2: Polygon-based OBB NMS with a tight IoU threshold (0.1) for
+    precise deduplication of oriented wakes.
+
+    Args:
+        detections: Detection dicts with ``"bbox"`` ``[cx, cy, w, h, angle]``
+            and ``"confidence"``.
+        horizontal_iou: Stage-1 axis-aligned IoU threshold (default 0.8).
+        polygon_iou: Stage-2 polygon IoU threshold (default 0.1).
+        confidence_threshold: Minimum confidence to enter NMS (default 0.05,
+            matching the paper; lower than typical 0.25 to preserve faint
+            turbulent wakes).
+
+    Returns:
+        Filtered detections after both NMS stages.
+    """
+    # Pre-filter by confidence
+    dets = [d for d in detections if d["confidence"] >= confidence_threshold]
+    if not dets:
+        return []
+
+    # Stage 1: fast horizontal NMS (coarse)
+    after_stage1 = _greedy_nms(dets, _aabb_iou, horizontal_iou)
+    logger.debug("Two-stage NMS: %d → %d after horizontal pass", len(dets), len(after_stage1))
+
+    # Stage 2: precise polygon NMS (tight)
+    after_stage2 = _greedy_nms(after_stage1, _obb_iou, polygon_iou)
+    logger.debug("Two-stage NMS: %d → %d after polygon pass", len(after_stage1), len(after_stage2))
+
+    return after_stage2
 
 
 # ---------------------------------------------------------------------------
@@ -198,8 +278,9 @@ def infer_scene(
     image_path: str | Path,
     tile_size: int = 1024,
     overlap: int = 128,
-    confidence_threshold: float = 0.25,
+    confidence_threshold: float = 0.05,
     iou_threshold: float = 0.45,
+    two_stage_nms: bool = True,
 ) -> list[dict[str, Any]]:
     """Run full-scene SAR inference using a tiled YOLOv8-OBB model.
 
@@ -207,13 +288,20 @@ def infer_scene(
     per-tile with their absolute pixel coordinates, and finally deduplicated
     with NMS.
 
+    By default uses the two-stage NMS strategy from the OpenSARWake paper:
+    coarse axis-aligned pass (IoU 0.8) followed by tight polygon pass
+    (IoU 0.1).  The lower confidence threshold (0.05 vs 0.25) preserves
+    faint turbulent wakes that would otherwise be discarded.
+
     Args:
         weights_path: Path to the trained YOLOv8-OBB weights file (``best.pt``).
         image_path: Path to the SAR scene image (GeoTIFF, PNG, JPEG, …).
         tile_size: Tile side length in pixels (default 1024).
         overlap: Tile overlap in pixels (default 128).
-        confidence_threshold: Detection confidence threshold (default 0.25).
-        iou_threshold: NMS IoU threshold (default 0.45).
+        confidence_threshold: Detection confidence threshold (default 0.05).
+        iou_threshold: NMS IoU threshold for single-pass mode (default 0.45).
+        two_stage_nms: If True (default), use two-stage NMS from the
+            OpenSARWake paper instead of single-pass polygon NMS.
 
     Returns:
         List of detection dicts (after NMS) with global pixel coordinates:
@@ -265,8 +353,16 @@ def infer_scene(
     logger.info(
         "Pre-NMS detections: %d across %d tiles", len(all_detections), len(tiles)
     )
-    final_detections = nms_obb(all_detections, iou_threshold=iou_threshold)
-    logger.info("Post-NMS detections: %d", len(final_detections))
+    if two_stage_nms:
+        final_detections = nms_obb_two_stage(
+            all_detections,
+            confidence_threshold=confidence_threshold,
+        )
+        logger.info("Post-NMS detections (two-stage): %d", len(final_detections))
+    else:
+        filtered = [d for d in all_detections if d["confidence"] >= confidence_threshold]
+        final_detections = nms_obb(filtered, iou_threshold=iou_threshold)
+        logger.info("Post-NMS detections (single-pass): %d", len(final_detections))
     return final_detections
 
 
@@ -311,14 +407,19 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--confidence",
         type=float,
-        default=0.25,
-        help="Detection confidence threshold (default: 0.25).",
+        default=0.05,
+        help="Detection confidence threshold (default: 0.05, per OpenSARWake paper).",
     )
     parser.add_argument(
         "--iou",
         type=float,
         default=0.45,
-        help="NMS IoU threshold (default: 0.45).",
+        help="NMS IoU threshold for single-pass mode (default: 0.45).",
+    )
+    parser.add_argument(
+        "--single-pass-nms",
+        action="store_true",
+        help="Use legacy single-pass NMS instead of two-stage (default: two-stage).",
     )
     return parser
 
@@ -333,6 +434,7 @@ def main() -> None:
         overlap=args.overlap,
         confidence_threshold=args.confidence,
         iou_threshold=args.iou,
+        two_stage_nms=not args.single_pass_nms,
     )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)

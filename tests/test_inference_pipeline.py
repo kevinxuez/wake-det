@@ -7,7 +7,7 @@ import math
 import numpy as np
 import pytest
 
-from src.inference.inference_pipeline import nms_obb, tile_image
+from src.inference.inference_pipeline import nms_obb, nms_obb_two_stage, tile_image
 
 
 # ---------------------------------------------------------------------------
@@ -109,3 +109,58 @@ class TestNmsObb:
         result = nms_obb(dets, iou_threshold=0.45)
         confs = [d["confidence"] for d in result]
         assert confs == sorted(confs, reverse=True)
+
+
+# ---------------------------------------------------------------------------
+# nms_obb_two_stage (OpenSARWake paper)
+# ---------------------------------------------------------------------------
+
+class TestNmsObbTwoStage:
+    def _make_det(self, cx, cy, w, h, angle, conf):
+        return {"bbox": [cx, cy, w, h, angle], "confidence": conf, "class": 0}
+
+    def test_empty_input(self):
+        assert nms_obb_two_stage([]) == []
+
+    def test_single_detection_kept(self):
+        det = self._make_det(100, 100, 50, 20, 0, 0.9)
+        result = nms_obb_two_stage([det])
+        assert len(result) == 1
+
+    def test_low_confidence_filtered(self):
+        """Detections below the confidence threshold should be dropped."""
+        det = self._make_det(100, 100, 50, 20, 0, 0.03)
+        result = nms_obb_two_stage([det], confidence_threshold=0.05)
+        assert len(result) == 0
+
+    def test_non_overlapping_kept(self):
+        """Well-separated boxes survive both NMS stages."""
+        dets = [
+            self._make_det(100, 100, 50, 20, 0, 0.9),
+            self._make_det(500, 500, 50, 20, 0, 0.8),
+            self._make_det(900, 900, 50, 20, 0, 0.7),
+        ]
+        result = nms_obb_two_stage(dets)
+        assert len(result) == 3
+
+    def test_identical_boxes_suppressed(self):
+        """Identical overlapping boxes: only highest confidence survives."""
+        dets = [
+            self._make_det(100, 100, 50, 20, 0, 0.95),
+            self._make_det(100, 100, 50, 20, 0, 0.5),
+        ]
+        result = nms_obb_two_stage(dets)
+        assert len(result) == 1
+        assert result[0]["confidence"] == 0.95
+
+    def test_tighter_than_single_pass(self):
+        """Two-stage NMS with tight polygon IoU (0.1) should be at least as
+        aggressive as single-pass NMS with IoU 0.45 on nearby boxes."""
+        # Slightly offset boxes that share some overlap
+        dets = [
+            self._make_det(100, 100, 80, 30, 0, 0.9),
+            self._make_det(110, 105, 80, 30, 0, 0.7),
+        ]
+        single_pass = nms_obb(dets, iou_threshold=0.45)
+        two_stage = nms_obb_two_stage(dets)
+        assert len(two_stage) <= len(single_pass)

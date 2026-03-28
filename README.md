@@ -10,11 +10,10 @@ via AIS correlation.
 
 ```
 ┌──────────────────────────────────────────────┐
-│  Step 1  Dataset Acquisition                 │
-│  src/data/download_datasets.py               │
-│  • Kaggle sar_wake (Gaofen-3)                │
-│  • OpenSARWake (OBB annotations, 3 973 imgs) │
-│  • 70 / 20 / 10 train/val/test split         │
+│  Step 1  OpenSARWake Dataset                 │
+│  data/splits/{train,val,test}/{images,labels}│
+│  • 3 973 images (L/C/X-band SAR, OBB labels) │
+│  • 1024×1024 px, pre-split 60/20/20          │
 └───────────────────┬──────────────────────────┘
                     │
 ┌───────────────────▼──────────────────────────┐
@@ -72,24 +71,43 @@ via AIS correlation.
 pip install -r requirements.txt
 ```
 
-### 2. Download datasets
+### 2. Prepare the OpenSARWake dataset
 
-```bash
-# Configure Kaggle credentials first: https://github.com/Kaggle/kaggle-api#api-credentials
-python src/data/download_datasets.py --output-dir data/
+Place the pre-split OpenSARWake data under `data/splits/`:
+
+```
+data/splits/
+├── train/
+│   ├── images/   (2 383 × 1024×1024 .png)
+│   └── labels/   (YOLO OBB .txt)
+├── val/
+│   ├── images/   (794 images)
+│   └── labels/
+└── test/
+    ├── images/   (796 images)
+    └── labels/
 ```
 
-### 3. Generate dataset YAML and train
+### 3. Train (choose one)
+
+**Option A — YOLOv8-OBB** (fast inference, anchor-free):
 
 ```bash
-# Auto-generate YAML from downloaded splits
 python src/train/train_yolov8_obb.py \
-    --generate-dataset-yaml data/splits/sar_wake_kaggle
+    --generate-dataset-yaml data/splits
 
-# Train (edit configs/train_config.yaml first to set GPU / batch size)
 python src/train/train_yolov8_obb.py \
     --config configs/train_config.yaml \
-    --data   data/splits/sar_wake_kaggle/dataset.yaml
+    --data   data/splits/dataset.yaml
+```
+
+**Option B — Oriented R-CNN** (higher mAP, two-stage, per OpenSARWake paper):
+
+```bash
+# Requires: pip install mmengine mmcv mmdet mmrotate
+python src/train/train_oriented_rcnn.py \
+    --config configs/train_config.yaml \
+    --data-root data/splits
 ```
 
 ### 4. Run inference on a SAR scene
@@ -169,11 +187,15 @@ client.send_webhook(
 wake-det/
 ├── configs/
 │   └── train_config.yaml          # Training hyper-parameters
+├── data/
+│   └── splits/
+│       ├── train/{images,labels}/  # OpenSARWake training split
+│       ├── val/{images,labels}/    # OpenSARWake validation split
+│       └── test/{images,labels}/   # OpenSARWake test split
 ├── src/
-│   ├── data/
-│   │   └── download_datasets.py   # Step 1: Dataset acquisition & splitting
 │   ├── train/
-│   │   └── train_yolov8_obb.py    # Step 2: YOLOv8-OBB training
+│   │   ├── train_yolov8_obb.py    # Step 2a: YOLOv8-OBB training
+│   │   └── train_oriented_rcnn.py # Step 2b: Oriented R-CNN (paper)
 │   ├── inference/
 │   │   └── inference_pipeline.py  # Step 3: Tiled inference + NMS
 │   ├── api/
@@ -207,7 +229,7 @@ pytest tests/ -v
 | Component | Reference |
 |-----------|-----------|
 | YOLOv8-OBB | Ultralytics YOLO (https://docs.ultralytics.com/tasks/obb/) |
-| OpenSARWake | 3 973-image multi-band SAR wake dataset with OBB labels |
+| OpenSARWake | 3 973-image multi-band SAR wake dataset (L/C/X-band, 1024×1024, OBB labels) |
 | Copernicus API | https://dataspace.copernicus.eu/analyse-and-process/apis |
 | Azimuth shift | Raney (1971); Bamler & Hartl (1998) |
 | AIS threshold | 150 m standard for cooperative-vessel matching |

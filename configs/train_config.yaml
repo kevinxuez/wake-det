@@ -1,22 +1,27 @@
-# YOLOv8-OBB Training Configuration for SAR Ship-Wake Detection
+# Training Configuration for SAR Ship-Wake Detection
+# Hyperparameters informed by OpenSARWake paper (Xu & Wang, 2024)
 
-model:
+# --- YOLOv8-OBB settings ---
+yolo:
   architecture: yolov8n-obb   # options: yolov8n/s/m/l/x-obb
-  pretrained: true             # start from COCO-pretrained weights
+  pretrained: true
+
+# --- Oriented R-CNN settings (paper's SWNet approach) ---
+oriented_rcnn:
+  backbone: convnext_tiny      # ConvNeXt-T as per paper
+  neck: fpn                    # standard FPN (HR-FPN* is paper-custom)
+  pretrained: true
 
 data:
-  dataset_root: data/
-  train_split: 0.70
-  val_split:   0.20
-  test_split:  0.10
+  dataset_root: data/splits/
   image_size: 1024             # pixels – matches OpenSARWake standard
 
 training:
-  epochs: 100
+  epochs: 300                  # paper uses 600 for Oriented R-CNN; 300 is reasonable for YOLO
   batch_size: 8
-  learning_rate: 0.01
-  optimizer: SGD
-  device: "0"                  # GPU index; set to "cpu" for CPU-only
+  learning_rate: 0.001         # Adam-family default; paper uses 0.0001 for Oriented R-CNN
+  optimizer: AdamW             # paper uses Adam; AdamW adds weight decay for better generalisation
+  device: "mps"                # Apple Silicon GPU; use "0" for CUDA, "cpu" for CPU-only
 
 augmentation:
   flipud: 0.5
