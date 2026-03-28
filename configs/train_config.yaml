@@ -1,0 +1,30 @@
+# YOLOv8-OBB Training Configuration for SAR Ship-Wake Detection
+
+model:
+  architecture: yolov8n-obb   # options: yolov8n/s/m/l/x-obb
+  pretrained: true             # start from COCO-pretrained weights
+
+data:
+  dataset_root: data/
+  train_split: 0.70
+  val_split:   0.20
+  test_split:  0.10
+  image_size: 1024             # pixels – matches OpenSARWake standard
+
+training:
+  epochs: 100
+  batch_size: 8
+  learning_rate: 0.01
+  optimizer: SGD
+  device: "0"                  # GPU index; set to "cpu" for CPU-only
+
+augmentation:
+  flipud: 0.5
+  fliplr: 0.5
+  degrees: 45                  # rotation augmentation for diagonal wakes
+  scale: 0.5
+  mosaic: 1.0
+
+output:
+  save_dir: runs/train/
+  weights_name: best.pt
