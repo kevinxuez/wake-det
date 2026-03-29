@@ -3,8 +3,9 @@ Preprocess SAR images for YOLOv8-OBB ship-wake detection.
 
 Applies three stages in order:
   1. Lee speckle filter  – reduces multiplicative SAR speckle noise
-  2. CLAHE               – enhances local contrast to reveal faint wakes
-  4. Per-image normalisation – rescales to full [0, 255] uint8 range
+  2. Global percentile normalisation – clips to fixed percentile range,
+     then rescales to [0, 255] using dataset-wide statistics (two-pass)
+  3. CLAHE               – enhances local contrast to reveal faint wakes
 
 The preprocessed images are written to a parallel directory structure so the
 originals are preserved. Update dataset.yaml paths to point at the new dirs.
@@ -15,7 +16,7 @@ Usage::
         --input-dir  data/splits/train/images \
         --output-dir data/splits_preprocessed/train/images
 
-    # Process all splits at once:
+    # Process all splits at once (recommended — computes global stats):
     python src/processing/preprocess_images.py --all-splits
 """
 
@@ -27,7 +28,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from scipy.ndimage import uniform_filter, uniform_filter1d
+from scipy.ndimage import uniform_filter
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -94,23 +95,91 @@ def apply_clahe(
 
 
 # ---------------------------------------------------------------------------
-# 4. Per-image normalisation
+# 3. Global percentile normalisation
 # ---------------------------------------------------------------------------
 
-def normalise_minmax(img: np.ndarray) -> np.ndarray:
-    """Rescale image intensities to the full [0, 255] uint8 range.
+def compute_global_percentiles(
+    image_dirs: list[Path],
+    lee_win: int = 7,
+    p_lo: float = 1.0,
+    p_hi: float = 99.0,
+    sample_cap: int = 500,
+) -> tuple[float, float]:
+    """Compute dataset-wide percentile bounds after Lee filtering.
+
+    Scans images across all provided directories, applies the Lee filter,
+    and collects pixel values to compute the p_lo and p_hi percentiles.
+    These are then used as fixed clipping bounds for normalisation.
 
     Args:
-        img: 2-D image (any numeric type).
+        image_dirs: List of directories containing source images.
+        lee_win: Lee filter window size.
+        p_lo: Lower percentile for clipping (default 1.0).
+        p_hi: Upper percentile for clipping (default 99.0).
+        sample_cap: Max images to sample per directory (for speed).
 
     Returns:
-        Min-max normalised uint8 image.
+        (global_lo, global_hi) — the percentile values across the dataset.
     """
-    img = img.astype(np.float64)
-    lo, hi = img.min(), img.max()
-    if hi - lo < 1e-8:
+    extensions = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
+    sampled_pixels: list[np.ndarray] = []
+
+    for img_dir in image_dirs:
+        if not img_dir.exists():
+            continue
+        image_files = sorted(
+            f for f in img_dir.iterdir() if f.suffix.lower() in extensions
+        )
+        # Subsample if directory is very large
+        if len(image_files) > sample_cap:
+            rng = np.random.default_rng(42)
+            indices = rng.choice(len(image_files), size=sample_cap, replace=False)
+            image_files = [image_files[i] for i in sorted(indices)]
+
+        for img_path in image_files:
+            img = cv2.imread(str(img_path), cv2.IMREAD_UNCHANGED)
+            if img is None:
+                continue
+            if img.ndim == 3:
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = img
+            filtered = lee_filter(gray.astype(np.float64), win_size=lee_win)
+            # Subsample pixels to keep memory bounded
+            flat = filtered.ravel()
+            if len(flat) > 10000:
+                rng = np.random.default_rng(hash(img_path.name) & 0xFFFFFFFF)
+                flat = rng.choice(flat, size=10000, replace=False)
+            sampled_pixels.append(flat)
+
+    all_pixels = np.concatenate(sampled_pixels)
+    global_lo = float(np.percentile(all_pixels, p_lo))
+    global_hi = float(np.percentile(all_pixels, p_hi))
+
+    logger.info(
+        "Global percentile stats: p%.1f=%.2f  p%.1f=%.2f  (from %d images)",
+        p_lo, global_lo, p_hi, global_hi, len(sampled_pixels),
+    )
+    return global_lo, global_hi
+
+
+def normalise_global_percentile(
+    img: np.ndarray, global_lo: float, global_hi: float,
+) -> np.ndarray:
+    """Clip to global percentile range and rescale to [0, 255] uint8.
+
+    Args:
+        img: 2-D float64 image (e.g. after Lee filtering).
+        global_lo: Lower clipping bound (dataset-wide percentile).
+        global_hi: Upper clipping bound (dataset-wide percentile).
+
+    Returns:
+        Normalised uint8 image.
+    """
+    if global_hi - global_lo < 1e-8:
         return np.zeros_like(img, dtype=np.uint8)
-    normalised = (img - lo) / (hi - lo) * 255.0
+    clipped = np.clip(img, global_lo, global_hi)
+    normalised = (clipped - global_lo) / (global_hi - global_lo) * 255.0
     return normalised.astype(np.uint8)
 
 
@@ -120,18 +189,22 @@ def normalise_minmax(img: np.ndarray) -> np.ndarray:
 
 def preprocess_image(
     img_bgr: np.ndarray,
+    global_lo: float,
+    global_hi: float,
     lee_win: int = 7,
     clahe_clip: float = 3.0,
     clahe_grid: tuple[int, int] = (8, 8),
 ) -> np.ndarray:
     """Run the full preprocessing pipeline on a single image.
 
-    Pipeline order: Lee filter -> CLAHE -> min-max normalisation.
+    Pipeline order: Lee filter -> global percentile normalisation -> CLAHE.
     Output is a 3-channel BGR image (grayscale duplicated) for YOLOv8
     compatibility.
 
     Args:
         img_bgr: Input BGR image as loaded by cv2.imread.
+        global_lo: Lower clipping bound from dataset-wide percentile stats.
+        global_hi: Upper clipping bound from dataset-wide percentile stats.
         lee_win: Lee filter window size.
         clahe_clip: CLAHE clip limit.
         clahe_grid: CLAHE tile grid size.
@@ -148,19 +221,18 @@ def preprocess_image(
     # 1. Lee speckle filter (operates on float)
     filtered = lee_filter(gray.astype(np.float64), win_size=lee_win)
 
-    # 4. Per-image normalisation (to uint8 for CLAHE input)
-    normed = normalise_minmax(filtered)
-
-    # 2. CLAHE (requires uint8)
-    enhanced = apply_clahe(normed, clip_limit=clahe_clip, tile_grid_size=clahe_grid)
+    # 2. Global percentile normalisation (to uint8)
+    normed = normalise_global_percentile(filtered, global_lo, global_hi)
 
     # Duplicate to 3-channel BGR for YOLOv8
-    return cv2.merge([enhanced, enhanced, enhanced])
+    return cv2.merge([normed, normed, normed])
 
 
 def process_directory(
     input_dir: Path,
     output_dir: Path,
+    global_lo: float,
+    global_hi: float,
     lee_win: int = 7,
     clahe_clip: float = 3.0,
     clahe_grid: tuple[int, int] = (8, 8),
@@ -184,7 +256,8 @@ def process_directory(
             continue
 
         result = preprocess_image(
-            img, lee_win=lee_win, clahe_clip=clahe_clip, clahe_grid=clahe_grid
+            img, global_lo, global_hi,
+            lee_win=lee_win, clahe_clip=clahe_clip, clahe_grid=clahe_grid,
         )
         cv2.imwrite(str(output_dir / img_path.name), result)
 
@@ -200,7 +273,7 @@ def process_directory(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Preprocess SAR images: Lee filter + CLAHE + normalisation."
+        description="Preprocess SAR images: Lee filter + global percentile norm + CLAHE."
     )
     parser.add_argument("--input-dir", type=Path, default=None,
                         help="Input image directory")
@@ -214,27 +287,48 @@ def main() -> None:
                         help="CLAHE clip limit (default 3.0)")
     parser.add_argument("--clahe-grid", type=int, default=8,
                         help="CLAHE tile grid size (default 8)")
+    parser.add_argument("--p-lo", type=float, default=1.0,
+                        help="Lower percentile for clipping (default 1.0)")
+    parser.add_argument("--p-hi", type=float, default=99.0,
+                        help="Upper percentile for clipping (default 99.0)")
     args = parser.parse_args()
 
     grid = (args.clahe_grid, args.clahe_grid)
-    kwargs = dict(lee_win=args.lee_win, clahe_clip=args.clahe_clip, clahe_grid=grid)
 
     if args.all_splits:
         base = Path("data/splits")
         out_base = Path("data/splits_preprocessed")
+
+        # --- Pass 1: compute global percentile bounds across all splits ---
+        all_image_dirs = [
+            base / split / "images"
+            for split in ["train", "val", "test"]
+            if (base / split / "images").exists()
+        ]
+        logger.info("--- Pass 1: computing global percentile stats ---")
+        global_lo, global_hi = compute_global_percentiles(
+            all_image_dirs, lee_win=args.lee_win,
+            p_lo=args.p_lo, p_hi=args.p_hi,
+        )
+
+        # --- Pass 2: preprocess all images using global bounds ---
         for split in ["train", "val", "test"]:
             src = base / split / "images"
             if src.exists():
-                logger.info("--- Processing %s ---", split)
-                # Copy labels alongside preprocessed images
+                logger.info("--- Pass 2: processing %s ---", split)
                 dst = out_base / split / "images"
-                process_directory(src, dst, **kwargs)
+                process_directory(
+                    src, dst, global_lo, global_hi,
+                    lee_win=args.lee_win, clahe_clip=args.clahe_clip,
+                    clahe_grid=grid,
+                )
                 # Symlink labels so the preprocessed dir is self-contained
                 labels_src = (base / split / "labels").resolve()
                 labels_dst = out_base / split / "labels"
                 if labels_src.exists() and not labels_dst.exists():
                     labels_dst.symlink_to(labels_src)
                     logger.info("Symlinked labels: %s -> %s", labels_dst, labels_src)
+
         # Write dataset.yaml for the preprocessed data
         import yaml
         dataset_cfg = {
@@ -248,8 +342,28 @@ def main() -> None:
         yaml_path = out_base / "dataset.yaml"
         yaml_path.write_text(yaml.dump(dataset_cfg, default_flow_style=False))
         logger.info("Dataset YAML written to %s", yaml_path)
+
+        # Save the global stats for reproducibility
+        stats_path = out_base / "global_norm_stats.txt"
+        stats_path.write_text(
+            f"p_lo={args.p_lo}  p_hi={args.p_hi}\n"
+            f"global_lo={global_lo:.6f}\n"
+            f"global_hi={global_hi:.6f}\n"
+            f"lee_win={args.lee_win}\n"
+        )
+        logger.info("Global stats saved to %s", stats_path)
+
     elif args.input_dir and args.output_dir:
-        process_directory(args.input_dir, args.output_dir, **kwargs)
+        # Single directory mode — compute stats from just that directory
+        logger.info("--- Computing percentile stats from %s ---", args.input_dir)
+        global_lo, global_hi = compute_global_percentiles(
+            [args.input_dir], lee_win=args.lee_win,
+            p_lo=args.p_lo, p_hi=args.p_hi,
+        )
+        process_directory(
+            args.input_dir, args.output_dir, global_lo, global_hi,
+            lee_win=args.lee_win, clahe_clip=args.clahe_clip, clahe_grid=grid,
+        )
     else:
         parser.error("Provide --input-dir and --output-dir, or use --all-splits")
 

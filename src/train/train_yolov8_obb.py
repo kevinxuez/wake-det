@@ -140,6 +140,7 @@ def train(
         mosaic=mosaic,
         flipud=0.5,
         fliplr=0.5,
+        cache=True,
     )
     elapsed = time.time() - t0
 
